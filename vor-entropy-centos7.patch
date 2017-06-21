@@ -1,0 +1,546 @@
+diff -uNr linux-3.10.0-327.el7.centos.x86_64/drivers/char/random.c linux-3.10.0-327.el7.local.x86_64/drivers/char/random.c
+--- linux-3.10.0-327.el7.centos.x86_64/drivers/char/random.c	2015-10-29 13:56:51.000000000 -0700
++++ linux-3.10.0-327.el7.local.x86_64/drivers/char/random.c	2016-09-13 16:24:05.549180286 -0700
+@@ -257,6 +257,13 @@
+ #include <linux/ptrace.h>
+ #include <linux/kmemcheck.h>
+ 
++/* To support RDRAND entropy source and /proc/entropy */
++#include <linux/seq_file.h>
++#include <linux/proc_fs.h>
++#include <linux/kthread.h>
++#include <linux/sched.h>
++
++
+ #ifdef CONFIG_GENERIC_HARDIRQS
+ # include <linux/irq.h>
+ #endif
+@@ -307,6 +314,12 @@
+  */
+ static int random_write_wakeup_thresh = 128;
+ 
++#if 0
++/*
++ * Update note from Vormetric Inc:
++ * trickle_thresh check is avoided in case to keep collecting balanced
++ * entropy sources
++ */
+ /*
+  * When the input pool goes over trickle_thresh, start dropping most
+  * samples to avoid wasting CPU time and reduce lock contention.
+@@ -314,6 +327,7 @@
+ static const int trickle_thresh = (INPUT_POOL_WORDS * 28) << ENTROPY_SHIFT;
+ 
+ static DEFINE_PER_CPU(int, trickle_count);
++#endif
+ 
+ /*
+  * A pool of size .poolwords is stirred with a primitive polynomial
+@@ -704,6 +718,150 @@
+ };
+ 
+ /*
++ * SP800-90B: repetition count test and adaptive proportion test
++ */
++#define REPETITION_COUNT_TEST_CUTOFF 11
++
++u32 repetition_count_test_counter = 0;
++u16 repetition_count_test_previous_sample = 0;
++
++/*
++ * repetition_count_test - checks whether the entropy source becomes
++ * stuck for a long time on the same value.
++ *
++ * Returns True when the test passes.
++ */
++bool
++repetition_count_test(u16 entropy_sample)
++{
++	if (repetition_count_test_counter == 0) {
++		/*
++		 * This is the first sample
++		 */
++		repetition_count_test_counter = 1;
++		repetition_count_test_previous_sample = entropy_sample;
++		return (true);
++	}
++	if (repetition_count_test_previous_sample == entropy_sample) {
++		/*
++		 * Encountered a repeat value.
++		 */
++		if ((++repetition_count_test_counter) >=
++		    REPETITION_COUNT_TEST_CUTOFF) {
++			/*
++			 * Too many repeat sample values.
++			 */
++			printk(KERN_ERR "repetition count test failed\n");
++			return (false);
++		}
++		/*
++		 * Acceptable number of repeat sample values.
++		 */
++		return (true);
++	}
++	/*
++	 * Encountered a non-repeating value.
++	 */
++	repetition_count_test_counter = 1;
++	repetition_count_test_previous_sample = entropy_sample;
++	return (true);
++}
++
++#define ADAPTIVE_PROPORTION_TEST_WINDOW_SIZE 4096
++#define ADAPTIVE_PROPORTION_TEST_CUTOFF 643
++
++u32 adaptive_proportion_test_hits = 0;
++u32 adaptive_proportion_test_count = ADAPTIVE_PROPORTION_TEST_WINDOW_SIZE;
++u16 adaptive_proportion_test_sample = 0;
++
++/*
++ * adaptive_proportion_test - This test checks for the condition
++ * where the entropy source generates the same value too frequently
++ * within a fixed number of samples (also called the window size).
++ *
++ * Returns True when the test passes.
++ */
++bool
++adaptive_proportion_test(u16 entropy_sample)
++{
++	if (adaptive_proportion_test_count >=
++	    ADAPTIVE_PROPORTION_TEST_WINDOW_SIZE) {
++		/*
++		 * Start the next test run
++		 */
++		adaptive_proportion_test_sample = entropy_sample;
++		adaptive_proportion_test_hits = 0;
++		adaptive_proportion_test_count = 0;
++		return (true);
++	}
++	adaptive_proportion_test_count++;
++
++	if (adaptive_proportion_test_sample == entropy_sample) {
++		adaptive_proportion_test_hits++;
++
++		if (adaptive_proportion_test_hits >=
++		    ADAPTIVE_PROPORTION_TEST_CUTOFF) {
++			/*
++			 * Too many repeat sample values.
++			 */
++			printk(KERN_ERR "adaptive proportion test failed\n");
++			return (false);
++		}
++	}
++	return (true);
++}
++
++/* #define ENABLE_ENTROPY_SAMPLES */
++#ifdef ENABLE_ENTROPY_SAMPLES
++#define RECORD_ENTROPY_SAMPLE	record_entropy_sample
++#define MAX_ENTROPY_SAMPLES	1000000
++#else
++#define RECORD_ENTROPY_SAMPLE(new, est, type)
++#define MAX_ENTROPY_SAMPLES 10
++#endif
++
++/*
++ * Record Entropy Samples
++ * The entropy types are
++ * 0=cycles, 1=rdrand for /dev/random, 2=rdrand_thread, 3=interrupts
++ */
++unsigned short	entropy_bytes[MAX_ENTROPY_SAMPLES];
++int		entropy_bits_est[MAX_ENTROPY_SAMPLES];
++int		entropy_type[MAX_ENTROPY_SAMPLES];
++
++/*
++ * Multiple threads can attempt to record entropy samples concurrently.
++ * This spinlock serializes the entropy sample data collection.
++ * We use a spinlock, because we cannot sleep.
++ */
++DEFINE_SPINLOCK(entropy_sample_spinlock);
++
++/* Current entropy sample count */
++int	sample_count = 0;
++
++/* Entropy sample count at the time when starting to read entropy samples */
++int	sample_count_end = 0;
++
++/*
++ * record_entropy_sample - this function records one entropy sample
++ * when there is room available for it.
++ */
++void
++record_entropy_sample(unsigned short sample_new, int sample_est, int sample_type)
++{
++	unsigned long   flags;
++
++	spin_lock_irqsave(&entropy_sample_spinlock, flags);
++	if (sample_count < MAX_ENTROPY_SAMPLES) {
++		entropy_bytes[sample_count] = sample_new;
++		entropy_bits_est[sample_count] = sample_est;
++		entropy_type[sample_count] = sample_type;
++		sample_count++;
++	}
++	spin_unlock_irqrestore(&entropy_sample_spinlock, flags);
++}
++
++/*
+  * Add device- or boot-specific data to the input and nonblocking
+  * pools to help initialize them to unique values.
+  *
+@@ -742,17 +900,33 @@
+ 		unsigned num;
+ 	} sample;
+ 	long delta, delta2, delta3;
++	int entropy_bits;
++	uint16_t entropy_data;
+ 
+ 	preempt_disable();
++#if 0
+ 	/* if over the trickle threshold, use only 1 in 4096 samples */
+ 	if (ENTROPY_BITS(&input_pool) > trickle_thresh &&
+ 	    ((__this_cpu_inc_return(trickle_count) - 1) & 0xfff))
+ 		goto out;
++#endif
+ 
+ 	sample.jiffies = jiffies;
+ 	sample.cycles = random_get_entropy();
+ 	sample.num = num;
+-	mix_pool_bytes(&input_pool, &sample, sizeof(sample), NULL);
++
++	entropy_data = (uint16_t)(((uint32_t)sample.jiffies ^ sample.cycles) & 0xffff);
++	if (!repetition_count_test(entropy_data)) {
++		/* Test failed */
++		preempt_enable();
++		return;
++	}
++
++	if (!adaptive_proportion_test(entropy_data)) {
++		/* Test failed */
++		preempt_enable();
++		return;
++	}
+ 
+ 	/*
+ 	 * Calculate number of bits of randomness we probably added.
+@@ -761,8 +935,9 @@
+ 	 */
+ 
+ 	if (!state->dont_count_entropy) {
+-		delta = sample.jiffies - state->last_time;
+-		state->last_time = sample.jiffies;
++
++		delta = sample.cycles - state->last_time;
++		state->last_time = sample.cycles;
+ 
+ 		delta2 = delta - state->last_delta;
+ 		state->last_delta = delta;
+@@ -784,12 +959,14 @@
+ 		/*
+ 		 * delta is now minimum absolute delta.
+ 		 * Round down by 1 bit on general principles,
+-		 * and limit entropy entimate to 12 bits.
++		 * and limit entropy entimate to 5 bits.
+ 		 */
+-		credit_entropy_bits(&input_pool,
+-				    min_t(int, fls(delta>>1), 11));
++		entropy_bits = min_t(int, fls(delta >> 1), 5);
++		RECORD_ENTROPY_SAMPLE(entropy_data, entropy_bits, 0);
++
++		mix_pool_bytes(&input_pool, &entropy_data, sizeof(entropy_data), NULL);
++		credit_entropy_bits(&input_pool, entropy_bits);
+ 	}
+-out:
+ 	preempt_enable();
+ }
+ 
+@@ -818,6 +995,7 @@
+ 	struct pt_regs		*regs = get_irq_regs();
+ 	unsigned long		now = jiffies;
+ 	__u32			input[4], cycles = random_get_entropy();
++	__u32			entropy_data;
+ 
+ 	input[0] = cycles ^ jiffies;
+ 	input[1] = irq;
+@@ -835,8 +1013,16 @@
+ 
+ 	fast_pool->last = now;
+ 
++	entropy_data = fast_pool->pool[0] ^ fast_pool->pool[1]
++		     ^ fast_pool->pool[2] ^ fast_pool->pool[3];
++	RECORD_ENTROPY_SAMPLE((__u16)(entropy_data&0xffff), 1, 3);
++	RECORD_ENTROPY_SAMPLE((__u16)((entropy_data>>16)&0xffff), 0, 3);
++
+ 	r = nonblocking_pool.initialized ? &input_pool : &nonblocking_pool;
++	__mix_pool_bytes(r, &entropy_data, sizeof(entropy_data), NULL);
++#if 0
+ 	__mix_pool_bytes(r, &fast_pool->pool, sizeof(fast_pool->pool), NULL);
++#endif
+ 	/*
+ 	 * If we don't have a valid cycle counter, and we see
+ 	 * back-to-back timer interrupts, then skip giving credit for
+@@ -867,6 +1053,58 @@
+ EXPORT_SYMBOL_GPL(add_disk_randomness);
+ #endif
+ 
++#define        MAX_RDRAND_RETRIES 64
++
++/*
++ * add_rdrand_randomness - checks whether the input entropy pool has
++ * sufficient entropy for the request. When there is not enough entropy,
++ * this function adds entropy by executing the Intel rdrand instruction.
++ * With each rdrand instruction, this function adds 32 bits to the
++ * input entropy pool and credits 1 bit of entropy.
++ */
++void
++add_rdrand_randomness(int wanted_bits)
++{
++	int		retry_count = 0;
++	int		number_bits;
++	unsigned int	therand;
++
++	/*
++	 * Want to ensure that there are enough entropy bits in the
++	 * input entropy pool to prevent stalling.
++	 *
++	 * The maximum transfer size (512 bits) plus the wakeup threshold
++	 * doubled (128 bits) is much less than the input entropy
++	 * pool size (4096). So we will not exceed size limits.
++	 */
++	number_bits = wanted_bits + (2 * random_read_wakeup_thresh);
++
++	if (number_bits > INPUT_POOL_WORDS * 32) {
++		/*
++		 * Limit the read request to the maximum
++		 * number of bits in the Input Entropy Pool.
++		 */
++		number_bits = INPUT_POOL_WORDS * 32;
++	}
++
++	while (number_bits > input_pool.entropy_count &&
++	    retry_count < MAX_RDRAND_RETRIES) {
++
++		if (arch_get_random_int(&therand)) {
++
++			RECORD_ENTROPY_SAMPLE((__u16)(therand & 0xffff), 2, 1);
++			RECORD_ENTROPY_SAMPLE((__u16)((therand >> 16) & 0xffff), 2, 1);
++
++			mix_pool_bytes(&input_pool, &therand, sizeof(therand), NULL);
++
++			credit_entropy_bits(&input_pool, 4);
++		} else {
++			retry_count++;
++		}
++	}
++}
++
++
+ /*********************************************************************
+  *
+  * Entropy extraction routines
+@@ -1168,6 +1406,188 @@
+ }
+ EXPORT_SYMBOL(get_random_bytes_arch);
+ 
++/*
++ * Support for /proc/entropy
++ *
++ * Each entropy sample constitutes one entry in the /proc/entropy pseudo file.
++ * The position in the file corresponds to the entropy entry number.
++ *
++ * Each entropy sample contains:
++ *	The value of the clock cycles at the time of the disk interrupt
++ *	The estimated number of bits of entropy added by this entropy sample
++ *	The type of entropy: 0=cycles, 1=rdrand
++ */
++
++/*
++ * entropy_seq_show - display one entropy sample
++ */
++static int
++entropy_seq_show(struct seq_file *entropy_file, void *iteratorp)
++{
++	int index = *((loff_t *)iteratorp);
++
++	seq_printf(entropy_file,
++	    "%d %u %d %d\n",
++	    index,
++	    entropy_bytes[index],
++	    entropy_bits_est[index],
++	    entropy_type[index]);
++
++	/* Show success */
++	return (0);
++}
++
++/*
++ * entropy_seq_start - set up the iterator to read the entropy samples
++ *
++ * Returns a pointer to an integer variable that is used to iterate
++ * over the entropy sample points.
++ */
++static void *
++entropy_seq_start(struct seq_file *entropy_file, loff_t *position)
++{
++	if (*position == 0) {
++		/*
++		 * This is the beginning.
++		 * Record the number of entropy samples collected
++		 */
++		sample_count_end = sample_count;
++		/*
++		 * Return a non null value to begin the sequence
++		 * This is also the entropy sample position
++		 */
++		return (position);
++	} else if ((*position >= sample_count_end) ||
++		   (*position < 0)) {
++		/*
++		 * This is the end
++		 */
++		*position = 0;
++		return (NULL);
++	} else {
++		/*
++		 * This is a continuation
++		 */
++		return (position);
++	}
++}
++
++/*
++ * entropy_seq_next - move to the next entropy sample
++ */
++static void *
++entropy_seq_next(struct seq_file *entropy_file, void *unused, loff_t *position)
++{
++	/* Advance to the next entropy sample */
++	(*position)++;
++
++	if (*position >= sample_count_end) {
++		/* Reached the end */
++		return (NULL);
++	} else {
++		return (position);
++	}
++}
++
++/*
++ * entropy_seq_stop - finished reading the entropy samples
++ */
++static void
++entropy_seq_stop(struct seq_file *entropy_file, void *unused)
++{
++	/* Start collecting a new collection of entropy samples */
++	sample_count = 0;
++}
++
++/*
++ * entropy_seq_ops - Needed to support output that would
++ * require more pages than can fit in a single page.
++ */
++static const struct seq_operations	entropy_seq_ops = {
++	.start	= entropy_seq_start,
++	.stop	= entropy_seq_stop,
++	.next	= entropy_seq_next,
++	.show	= entropy_seq_show,
++};
++
++/*
++ * entropy_proc_open
++ * This opens the Entropy sample reporting file in ProcFS
++ */
++static int
++entropy_proc_open(struct inode *inode, struct file *file)
++{
++	return (seq_open(file,
++	    (struct seq_operations *)&entropy_seq_ops));
++}
++
++/*
++ * This define the ProcFS file operations for Entropy reporting
++ */
++static const struct file_operations entropy_proc_fops = {
++	.owner	= THIS_MODULE,
++	.open	= entropy_proc_open,
++	.read	= seq_read,
++	.llseek = seq_lseek,
++	.release = seq_release,
++};
++
++/*
++ * init_entropy_procfs - provides a mechanism for reporting
++ * collected entropy samples.
++ */
++void
++init_entropy_procfs(void)
++{
++	if (!proc_create("entropy", 0, NULL, &entropy_proc_fops)) {
++		printk(KERN_ERR "Failed to create /proc/entropy\n");
++	}
++}
++
++/*
++ * rdrand_thread - This thread runs forever.
++ * This thread executes the rdrand instruction once per second
++ * and adds the resulting entropy to the Input Entropy Pool.
++ */
++int
++rdrand_thread(void *data)
++{
++	unsigned int therand;
++
++	while (true) {
++
++		set_current_state(TASK_UNINTERRUPTIBLE);
++		schedule_timeout(msecs_to_jiffies(1000));
++
++		if (arch_get_random_int(&therand)) {
++
++			RECORD_ENTROPY_SAMPLE((__u16)(therand & 0xffff), 2, 2);
++			RECORD_ENTROPY_SAMPLE((__u16)((therand >> 16) & 0xffff), 2, 2);
++
++			mix_pool_bytes(&input_pool, &therand, sizeof(therand), NULL);
++
++			credit_entropy_bits(&input_pool, 4);
++		}
++	}
++	return (0);
++}
++
++struct task_struct      *rdrand_threadp = NULL;
++
++/*
++ * init_rdrand_thread - initializes the thread that executes the
++ * rdrand instruction once per second.
++ */
++void
++init_rdrand_thread(void)
++{
++	rdrand_threadp = kthread_run(rdrand_thread, NULL, "rdrand_thread");
++
++	if (IS_ERR(rdrand_threadp)) {
++		printk(KERN_ERR "Failed to create rdrand thread\n");
++	}
++}
++
+ 
+ /*
+  * init_std_data - initialize pool with system data
+@@ -1211,6 +1631,8 @@
+ 	init_std_data(&input_pool);
+ 	init_std_data(&blocking_pool);
+ 	init_std_data(&nonblocking_pool);
++	init_entropy_procfs();
++	init_rdrand_thread();
+ 	return 0;
+ }
+ module_init(rand_initialize);
+@@ -1245,6 +1667,8 @@
+ 
+ 		DEBUG_ENT("reading %zu bits\n", n*8);
+ 
++		add_rdrand_randomness(n * 8);
++
+ 		n = extract_entropy_user(&blocking_pool, buf, n);
+ 
+ 		if (n < 0) {
